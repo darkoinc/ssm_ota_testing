@@ -30,7 +30,7 @@ void performOTA(const String& firmwareUrl) {
   Serial.println("[OTA] Starting update from: " + firmwareUrl);
 
   WiFiClientSecure client;
-  client.setInsecure(); // ⚠️ In production, validate your cert.
+  client.setInsecure();
 
   HTTPClient https;
   if (!https.begin(client, firmwareUrl)) {
@@ -39,6 +39,8 @@ void performOTA(const String& firmwareUrl) {
   }
 
   int httpCode = https.GET();
+  Serial.printf("[OTA] HTTP GET code: %d\n", httpCode);
+
   if (httpCode != HTTP_CODE_OK) {
     Serial.printf("[OTA] HTTP GET failed, code: %d\n", httpCode);
     https.end();
@@ -46,8 +48,15 @@ void performOTA(const String& firmwareUrl) {
   }
 
   int contentLength = https.getSize();
-  bool canBegin = Update.begin(contentLength);
+  Serial.printf("[OTA] Content-Length: %d bytes\n", contentLength);
 
+  if (contentLength <= 0) {
+    Serial.println("[OTA] Invalid content length, aborting.");
+    https.end();
+    return;
+  }
+
+  bool canBegin = Update.begin(contentLength);
   if (!canBegin) {
     Serial.println("[OTA] Not enough space for update!");
     https.end();
@@ -56,6 +65,8 @@ void performOTA(const String& firmwareUrl) {
 
   WiFiClient *stream = https.getStreamPtr();
   size_t written = Update.writeStream(*stream);
+
+  Serial.printf("[OTA] Written: %d bytes\n", written);
 
   if (Update.end()) {
     if (Update.isFinished()) {
@@ -73,6 +84,7 @@ void performOTA(const String& firmwareUrl) {
   https.end();
 }
 
+
 // ==============================
 // Losant Command Handler
 // ==============================
@@ -88,12 +100,37 @@ void handleCommand(LosantCommand *command) {
 
     if (newVersion != CURRENT_FIRMWARE_VERSION) {
       Serial.println("[OTA] New version detected, starting update...");
-      performOTA(firmwareUrl);
+      String finalURL = getFinalURL(firmwareUrl);
+      performOTA(finalURL);
     } else {
       Serial.println("[OTA] Already on latest version.");
     }
   }
 }
+
+String getFinalURL(const String& url) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  String currentURL = url;
+  int redirectCount = 0;
+  while (redirectCount < 5) {
+    if (!https.begin(client, currentURL)) return "";
+    int code = https.GET();
+    if (code >= 300 && code < 400) {
+      currentURL = https.getLocation();  // Get Location header
+      Serial.println("[OTA] Redirected to: " + currentURL);
+      https.end();
+      redirectCount++;
+    } else {
+      https.end();
+      break;
+    }
+  }
+  return currentURL;
+}
+
 
 // ==============================
 // Setup
@@ -121,8 +158,6 @@ void setup() {
   root["status"] = "online";
   root["version"] = CURRENT_FIRMWARE_VERSION;
   device.sendState(root);
-
-  Serial.println(F("Device Updated"));
 }
 
 // ==============================
