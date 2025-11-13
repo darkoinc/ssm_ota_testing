@@ -3,108 +3,38 @@
 #include <Update.h>
 #include <Losant.h>
 #include <ArduinoJson.h>
+#include <SPIFFS.h>
+#include "time.h"
 
-// ==============================
-// User Configuration
-// ==============================
 #define WIFI_SSID       "Elab"
 #define WIFI_PASS       "2026summit"
 
-#define LOSANT_DEVICE_ID     "690dfa233555b34f9d0cb8bd"
+#define LOSANT_DEVICE_ID     "691254353103dc7662730a47"
 #define LOSANT_ACCESS_KEY    "73143249-63e0-4cb3-8ad1-9774bd2dc51c"
 #define LOSANT_ACCESS_SECRET "5d6b577fffb2fb2c282cb154dbb04f9971baa396c626fc1d5a848b4eb87c8959"
 
-// Current firmware version
 #define CURRENT_FIRMWARE_VERSION "1.0.0"
 
-// ==============================
-// Globals
-// ==============================
+// Local timezone offset (e.g. UTC−5)
+#define TZ_OFFSET_SEC  (-18000)
+#define DST_OFFSET_SEC (3600)
+
+// Time of day to apply updates
+#define UPDATE_HOUR   15
+#define UPDATE_MINUTE 42
+
 WiFiClientSecure wifiClient;
 LosantDevice device(LOSANT_DEVICE_ID);
+String pendingFirmwarePath = "/pending_firmware.bin";
+bool updateScheduled = false;
 
-// ==============================
-// OTA Update Function
-// ==============================
-void performOTA(const String& firmwareUrl) {
-  Serial.println("[OTA] Starting update from: " + firmwareUrl);
-
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient https;
-  if (!https.begin(client, firmwareUrl)) {
-    Serial.println("[OTA] HTTPS begin failed!");
-    return;
-  }
-
-  int httpCode = https.GET();
-  Serial.printf("[OTA] HTTP GET code: %d\n", httpCode);
-
-  if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("[OTA] HTTP GET failed, code: %d\n", httpCode);
-    https.end();
-    return;
-  }
-
-  int contentLength = https.getSize();
-  Serial.printf("[OTA] Content-Length: %d bytes\n", contentLength);
-
-  if (contentLength <= 0) {
-    Serial.println("[OTA] Invalid content length, aborting.");
-    https.end();
-    return;
-  }
-
-  bool canBegin = Update.begin(contentLength);
-  if (!canBegin) {
-    Serial.println("[OTA] Not enough space for update!");
-    https.end();
-    return;
-  }
-
-  WiFiClient *stream = https.getStreamPtr();
-  size_t written = Update.writeStream(*stream);
-
-  Serial.printf("[OTA] Written: %d bytes\n", written);
-
-  if (Update.end()) {
-    if (Update.isFinished()) {
-      Serial.println("[OTA] Update complete! Rebooting...");
-      https.end();
-      delay(2000);
-      ESP.restart();
-    } else {
-      Serial.println("[OTA] Update failed to finish!");
-    }
+void setupTime() {
+  configTime(TZ_OFFSET_SEC, DST_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    Serial.printf("[Time] Current local time: %02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min);
   } else {
-    Serial.printf("[OTA] Update error: %s\n", Update.errorString());
-  }
-
-  https.end();
-}
-
-
-// ==============================
-// Losant Command Handler
-// ==============================
-void handleCommand(LosantCommand *command) {
-  Serial.printf("[Losant] Command received: %s\n", command->name);
-
-  if (strcmp(command->name, "ota_update") == 0) {
-    String firmwareUrl = (*command->payload)["url"].as<String>();
-    String newVersion  = (*command->payload)["version"].as<String>();
-
-    Serial.printf("[OTA] New version: %s\n", newVersion.c_str());
-    Serial.printf("[OTA] Current version: %s\n", CURRENT_FIRMWARE_VERSION);
-
-    if (newVersion != CURRENT_FIRMWARE_VERSION) {
-      Serial.println("[OTA] New version detected, starting update...");
-      String finalURL = getFinalURL(firmwareUrl);
-      performOTA(finalURL);
-    } else {
-      Serial.println("[OTA] Already on latest version.");
-    }
+    Serial.println("[Time] Failed to obtain time");
   }
 }
 
@@ -115,11 +45,12 @@ String getFinalURL(const String& url) {
 
   String currentURL = url;
   int redirectCount = 0;
+
   while (redirectCount < 5) {
     if (!https.begin(client, currentURL)) return "";
     int code = https.GET();
     if (code >= 300 && code < 400) {
-      currentURL = https.getLocation();  // Get Location header
+      currentURL = https.getLocation();
       Serial.println("[OTA] Redirected to: " + currentURL);
       https.end();
       redirectCount++;
@@ -131,13 +62,127 @@ String getFinalURL(const String& url) {
   return currentURL;
 }
 
+bool downloadFirmware(const String& firmwareUrl) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
 
-// ==============================
-// Setup
-// ==============================
+  Serial.println("[OTA] Resolving final firmware URL...");
+  String finalURL = getFinalURL(firmwareUrl);
+  if (finalURL == "") {
+    Serial.println("[OTA] Failed to resolve redirect chain.");
+    return false;
+  }
+
+  Serial.println("[OTA] Starting download from: " + finalURL);
+  if (!https.begin(client, finalURL)) {
+    Serial.println("[OTA] HTTPS begin failed!");
+    return false;
+  }
+
+  int httpCode = https.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("[OTA] HTTP GET failed, code: %d\n", httpCode);
+    https.end();
+    return false;
+  }
+
+  int contentLength = https.getSize();
+  Serial.printf("[OTA] Downloading firmware (%d bytes)...\n", contentLength);
+
+  File fwFile = SPIFFS.open(pendingFirmwarePath, FILE_WRITE);
+  if (!fwFile) {
+    Serial.println("[SPIFFS] Failed to open file for writing");
+    https.end();
+    return false;
+  }
+
+  WiFiClient *stream = https.getStreamPtr();
+  uint8_t buff[256];
+  int written = 0;
+  while (https.connected() && (written < contentLength)) {
+    size_t size = stream->available();
+    if (size) {
+      int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
+      fwFile.write(buff, c);
+      written += c;
+    }
+    delay(1);
+  }
+
+  fwFile.close();
+  https.end();
+
+  Serial.printf("[OTA] Firmware saved to SPIFFS (%d bytes)\n", written);
+  return true;
+}
+
+void applyUpdateNow() {
+  File fwFile = SPIFFS.open(pendingFirmwarePath);
+  if (!fwFile) {
+    Serial.println("[OTA] No firmware file found for immediate update.");
+    return;
+  }
+
+  Serial.println("[OTA] Applying pending firmware now...");
+  if (!Update.begin(fwFile.size())) {
+    Serial.println("[OTA] Not enough space for update!");
+    fwFile.close();
+    return;
+  }
+
+  size_t written = Update.writeStream(fwFile);
+  fwFile.close();
+
+  if (Update.end() && Update.isFinished()) {
+    Serial.println("[OTA] Update complete! Rebooting...");
+    SPIFFS.remove(pendingFirmwarePath); // ✅ delete to free space
+    delay(2000);
+    ESP.restart();
+  } else {
+    Serial.printf("[OTA] Update failed: %s\n", Update.errorString());
+  }
+}
+
+void checkAndApplyScheduledUpdate() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  if (timeinfo.tm_hour == UPDATE_HOUR && timeinfo.tm_min == UPDATE_MINUTE) {
+    if (SPIFFS.exists(pendingFirmwarePath)) {
+      applyUpdateNow();
+    }
+  }
+}
+
+void handleCommand(LosantCommand *command) {
+  Serial.printf("[Losant] Command received: %s\n", command->name);
+
+  if (strcmp(command->name, "ota_update") == 0) {
+    String firmwareUrl = (*command->payload)["url"].as<String>();
+    String newVersion  = (*command->payload)["version"].as<String>();
+
+    Serial.printf("[OTA] New version: %s\n", newVersion.c_str());
+    Serial.printf("[OTA] Current version: %s\n", CURRENT_FIRMWARE_VERSION);
+
+    if (newVersion != CURRENT_FIRMWARE_VERSION) {
+      Serial.println("[OTA] New version detected — downloading now, will install at scheduled time.");
+      if (downloadFirmware(firmwareUrl)) {
+        updateScheduled = true;
+      }
+    } else {
+      Serial.println("[OTA] Already on latest version.");
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[SPIFFS] Mount failed");
+  }
 
   Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -147,31 +192,30 @@ void setup() {
   }
   Serial.println("\n[WiFi] Connected!");
 
-  wifiClient.setInsecure(); // for testing
+  setupTime();
+
+  wifiClient.setInsecure();
   device.connectSecure(wifiClient, LOSANT_ACCESS_KEY, LOSANT_ACCESS_SECRET);
   device.onCommand(&handleCommand);
 
   Serial.println("[Losant] Connected to Losant!");
 
-  DynamicJsonDocument state(256);
-  JsonObject root = state.to<JsonObject>();
-  root["status"] = "online";
-  root["version"] = CURRENT_FIRMWARE_VERSION;
-  device.sendState(root);
+  // ✅ Apply pending firmware immediately if found
+  if (SPIFFS.exists(pendingFirmwarePath)) {
+    Serial.println("[OTA] Pending firmware found at boot — applying immediately.");
+    applyUpdateNow();
+  }
 }
 
-// ==============================
-// Main Loop
-// ==============================
 void loop() {
   device.loop();
 
-  static unsigned long lastPing = 0;
-  if (millis() - lastPing > 60000) {
-    lastPing = millis();
-    DynamicJsonDocument heartbeat(64);
-    JsonObject hb = heartbeat.to<JsonObject>();
-    hb["heartbeat"] = true;
-    device.sendState(hb);
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 60000) {
+    lastCheck = millis();
+
+    if (updateScheduled || SPIFFS.exists(pendingFirmwarePath)) {
+      checkAndApplyScheduledUpdate();
+    }
   }
 }
