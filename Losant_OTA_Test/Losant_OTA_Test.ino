@@ -1,215 +1,320 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Update.h>
-#include "SPIFFS.h"
-#include "mbedtls/sha256.h"
+#include <SPIFFS.h>
+#include <mbedtls/sha256.h>
 #include <ArduinoJson.h>
+#include "time.h"
 
-// WiFi credentials
+// ====== USER CONFIG ======
 const char* ssid = "Elab";
 const char* password = "2026summit";
 
-// Manifest URL
-const char* manifestURL = "https://raw.githubusercontent.com/darkoinc/SSM_OTA_Host/refs/heads/main/manifest.json";
+// Current firmware version of the device
+const char* currentVersion = "1.0.0";
 
-// Current firmware version
-const char* currentVersion = "1.0.1";
+// Scheduled OTA check time
+const int SCHEDULED_HOUR_UTC = 6;
+const int SCHEDULED_MINUTE_UTC = 0;
 
-// OTA settings
-const int maxRetries = 3;
+// NTP config
+const char* NTP_SERVER = "pool.ntp.org";
+const long  GMT_OFFSET_SEC = 0;
+const int   DAYLIGHT_OFFSET_SEC = 0;
 
-// Utility: compute SHA256 of a file in SPIFFS
-String sha256File(File &file) {
+// Max OTA retries
+const int MAX_OTA_RETRIES = 3;
+
+// ====== GLOBALS ======
+bool scheduledRunToday = false;
+bool bootUpdateApplied = false;
+
+// Firmware info structure
+struct FirmwareInfo {
+  String version;
+  String url;
+  String sha256;
+};
+
+// ====== HELPER FUNCTIONS ======
+void initSPIFFS() {
+  if(!SPIFFS.begin(true)) {
+    Serial.println("[SPIFFS] Failed to mount SPIFFS!");
+  } else {
+    Serial.println("[SPIFFS] Mounted successfully.");
+  }
+}
+
+void initWiFi() {
+  Serial.printf("[WiFi] Connecting to %s...\n", ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n[WiFi] Connected!");
+}
+
+void initNTP() {
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  Serial.print("[Time] Waiting for NTP sync");
+  uint32_t start = millis();
+  while (time(nullptr) < 100000) {
+    delay(250);
+    Serial.print(".");
+    if (millis() - start > 15000) { // 15s timeout
+      Serial.println("\n[Time] NTP sync timeout, retry later.");
+      break;
+    }
+  }
+  Serial.println("\n[Time] NTP initialized.");
+}
+
+bool isNewerVersion(const String& newVer, const String& currentVer) {
+  return newVer != currentVer; // simple check; can be improved with proper semantic version comparison
+}
+
+// Compute SHA256 of buffer
+void computeSHA256(const uint8_t* data, size_t len, uint8_t* outHash) {
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts_ret(&ctx, 0);
+  mbedtls_sha256_update_ret(&ctx, data, len);
+  mbedtls_sha256_finish_ret(&ctx, outHash);
+  mbedtls_sha256_free(&ctx);
+}
+
+// Convert byte array to hex string
+String hashToString(const uint8_t* hash, size_t len) {
+  String s;
+  for(size_t i=0;i<len;i++){
+    if(hash[i] < 16) s += "0";
+    s += String(hash[i], HEX);
+  }
+  s.toLowerCase();
+  return s;
+}
+
+// Fetch manifest from a URL
+bool fetchManifest(FirmwareInfo &fw) {
+  const char* manifestURL = "https://raw.githubusercontent.com/darkoinc/SSM_OTA_Host/refs/heads/main/manifest.json"; // set your manifest URL
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip cert verification for GitHub (optional, not for production)
+  
+  HTTPClient https;
+  if(!https.begin(client, manifestURL)) {
+    Serial.println("[Manifest] HTTPS begin failed");
+    return false;
+  }
+  
+  int httpCode = https.GET();
+  if(httpCode != HTTP_CODE_OK) {
+    Serial.printf("[Manifest] GET failed: %d\n", httpCode);
+    https.end();
+    return false;
+  }
+  
+  String payload = https.getString();
+  https.end();
+
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, payload);
+  if(error){
+    Serial.println("[Manifest] JSON parse failed!");
+    return false;
+  }
+
+  fw.version = doc["version"].as<String>();
+  fw.url = doc["url"].as<String>();
+  fw.sha256 = doc["sha256"].as<String>();
+  
+  Serial.printf("[Manifest] version=%s url=%s sha256=%s\n", fw.version.c_str(), fw.url.c_str(), fw.sha256.c_str());
+  return true;
+}
+
+// Download firmware to SPIFFS
+bool downloadFirmware(const String &url, const String &expectedSha) {
+  for(int attempt=1; attempt <= MAX_OTA_RETRIES; attempt++){
+    Serial.printf("[OTA] Download attempt %d\n", attempt);
+    
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient https;
+    
+    if(!https.begin(client, url)){
+      Serial.println("[OTA] HTTPS begin failed");
+      continue;
+    }
+
+    int httpCode = https.GET();
+    if(httpCode != HTTP_CODE_OK && httpCode != HTTP_CODE_MOVED_PERMANENTLY && httpCode != HTTP_CODE_FOUND){
+      Serial.printf("[OTA] HTTP GET failed: %d\n", httpCode);
+      https.end();
+      continue;
+    }
+
+    // Follow redirect if needed
+    if(httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND){
+      String newLocation = https.getLocation();
+      Serial.printf("[OTA] Redirected to: %s\n", newLocation.c_str());
+      https.end();
+      return downloadFirmware(newLocation, expectedSha); // recursive redirect follow
+    }
+
+    int contentLength = https.getSize();
+    if(contentLength <= 0){
+      Serial.println("[OTA] Content-Length invalid");
+      https.end();
+      continue;
+    }
+
+    File fwFile = SPIFFS.open("/pending_firmware.bin", FILE_WRITE);
+    if(!fwFile){
+      Serial.println("[OTA] Failed to open SPIFFS for writing");
+      https.end();
+      return false;
+    }
+
+    WiFiClient *stream = https.getStreamPtr();
+    int bytesRead = 0;
+    uint8_t buf[512];
+    while(https.connected() && bytesRead < contentLength){
+      int len = stream->readBytes(buf, sizeof(buf));
+      if(len <= 0) break;
+      fwFile.write(buf, len);
+      bytesRead += len;
+      Serial.printf("[OTA] Downloaded %d/%d bytes\n", bytesRead, contentLength);
+    }
+
+    fwFile.close();
+    https.end();
+
+    // Verify SHA256
+    File verifyFile = SPIFFS.open("/pending_firmware.bin", FILE_READ);
+    if(!verifyFile){
+      Serial.println("[OTA] Failed to open SPIFFS for verification");
+      continue;
+    }
+
     mbedtls_sha256_context ctx;
     mbedtls_sha256_init(&ctx);
-    mbedtls_sha256_starts(&ctx, 0); // 0 = SHA-256
+    mbedtls_sha256_starts_ret(&ctx, 0);
 
-    uint8_t buffer[1024];
-    while(file.available()){
-        size_t len = file.read(buffer, sizeof(buffer));
-        mbedtls_sha256_update(&ctx, buffer, len);
+    while(verifyFile.available()){
+      int len = verifyFile.read(buf, sizeof(buf));
+      mbedtls_sha256_update_ret(&ctx, buf, len);
     }
+
+    verifyFile.close();
 
     uint8_t hash[32];
-    mbedtls_sha256_finish(&ctx, hash);
+    mbedtls_sha256_finish_ret(&ctx, hash);
     mbedtls_sha256_free(&ctx);
 
-    String hashStr = "";
-    for(int i=0;i<32;i++){
-        if(hash[i] < 16) hashStr += "0";
-        hashStr += String(hash[i], HEX);
+    String hashStr = hashToString(hash, sizeof(hash));
+    Serial.printf("[SHA256] Computed: %s\n", hashStr.c_str());
+    Serial.printf("[SHA256] Expected: %s\n", expectedSha.c_str());
+
+    if(hashStr == expectedSha){
+      Serial.println("[OTA] SHA256 match! Firmware ready.");
+      return true;
+    } else {
+      Serial.println("[OTA] SHA256 mismatch! Retrying...");
+      SPIFFS.remove("/pending_firmware.bin");
     }
-    hashStr.toLowerCase();
-    return hashStr;
+  }
+
+  Serial.println("[OTA] Failed to download/verify firmware after retries.");
+  return false;
 }
 
-// Download and verify firmware
-bool downloadAndVerifyFirmware(const String &url, const String &expectedSha) {
-    for(int attempt = 1; attempt <= maxRetries; attempt++) {
-        Serial.printf("[OTA] Download attempt %d\n", attempt);
-
-        HTTPClient http;
-        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-        http.begin(url);
-        int httpCode = http.GET();
-
-        if(httpCode != HTTP_CODE_OK) {
-            Serial.printf("[OTA] HTTP GET failed: %d\n", httpCode);
-            http.end();
-            delay(1000);
-            continue;
-        }
-
-        int contentLength = http.getSize();
-        if(contentLength <= 0) {
-            Serial.println("[OTA] Invalid content length");
-            http.end();
-            return false;
-        }
-
-        if(!SPIFFS.begin(true)) {
-            Serial.println("[OTA] SPIFFS mount failed");
-            http.end();
-            return false;
-        }
-
-        File file = SPIFFS.open("/pending_firmware.bin", FILE_WRITE);
-        if(!file) {
-            Serial.println("[OTA] Failed to open SPIFFS for writing");
-            http.end();
-            return false;
-        }
-
-        WiFiClient *stream = http.getStreamPtr();
-        int written = 0;
-        uint8_t buff[512];
-        while(http.connected() && written < contentLength) {
-            size_t availableBytes = stream->available();
-            if(availableBytes) {
-                size_t toRead = availableBytes > sizeof(buff) ? sizeof(buff) : availableBytes;
-                int readBytes = stream->readBytes(buff, toRead);
-                file.write(buff, readBytes);
-                written += readBytes;
-                Serial.printf("[OTA] Downloaded %d/%d bytes\n", written, contentLength);
-            }
-            delay(1);
-        }
-
-        file.close();
-        http.end();
-
-        // Verify SHA256
-        File verifyFile = SPIFFS.open("/pending_firmware.bin");
-        String computedSha = sha256File(verifyFile);
-        verifyFile.close();
-
-        Serial.printf("[SHA256] Computed: %s\n", computedSha.c_str());
-        Serial.printf("[SHA256] Expected: %s\n", expectedSha.c_str());
-
-        if(computedSha == expectedSha) {
-            Serial.println("[OTA] SHA256 verified!");
-            return true;
-        } else {
-            Serial.println("[OTA] SHA256 mismatch! Deleting file and retrying...");
-            SPIFFS.remove("/pending_firmware.bin");
-        }
-    }
-    return false;
-}
-
-// Apply firmware
+// Apply firmware from SPIFFS
 bool applyFirmware() {
-    File updateFile = SPIFFS.open("/pending_firmware.bin");
-    if(!updateFile) {
-        Serial.println("[OTA] No firmware file to apply");
-        return false;
-    }
-
-    if(Update.begin(updateFile.size())) {
-        size_t written = Update.writeStream(updateFile);
-        if(written == updateFile.size()) {
-            Serial.println("[OTA] Firmware written successfully. Rebooting...");
-            if(Update.end()) {
-                updateFile.close();
-                SPIFFS.remove("/pending_firmware.bin");
-                ESP.restart();
-                return true;
-            } else {
-                Serial.printf("[OTA] Update end failed: %s\n", Update.errorString());
-            }
-        } else {
-            Serial.println("[OTA] Write size mismatch");
-        }
-    } else {
-        Serial.printf("[OTA] Update begin failed: %s\n", Update.errorString());
-    }
-    updateFile.close();
+  File fwFile = SPIFFS.open("/pending_firmware.bin", FILE_READ);
+  if(!fwFile){
+    Serial.println("[OTA] Firmware file not found");
     return false;
+  }
+
+  if(!Update.begin(fwFile.size())){
+    Serial.println("[OTA] Update begin failed");
+    fwFile.close();
+    return false;
+  }
+
+  size_t written = Update.writeStream(fwFile);
+  fwFile.close();
+
+  if(written != Update.size()){
+    Serial.println("[OTA] Update write incomplete");
+    return false;
+  }
+
+  if(!Update.end(true)){
+    Serial.println("[OTA] Update finalize failed");
+    return false;
+  }
+
+  Serial.println("[OTA] Firmware applied successfully! Rebooting...");
+  ESP.restart();
+  return true;
 }
 
-// Fetch manifest
-bool fetchManifest(String &version, String &url, String &sha256) {
-    HTTPClient http;
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.begin(manifestURL);
-    int httpCode = http.GET();
-
-    if(httpCode != HTTP_CODE_OK) {
-        Serial.printf("[Manifest] HTTP GET failed: %d\n", httpCode);
-        http.end();
-        return false;
+// Boot-time firmware check
+void bootFirmwareCheck() {
+  FirmwareInfo fw;
+  if(fetchManifest(fw) && isNewerVersion(fw.version, currentVersion)){
+    Serial.println("[BootCheck] New firmware available, applying immediately...");
+    if(downloadFirmware(fw.url, fw.sha256)){
+      applyFirmware();
+      bootUpdateApplied = true;
     }
-
-    String payload = http.getString();
-    http.end();
-
-    StaticJsonDocument<512> doc;
-    DeserializationError error = deserializeJson(doc, payload);
-    if(error) {
-        Serial.printf("[Manifest] JSON parse failed: %s\n", error.c_str());
-        return false;
-    }
-
-    version = doc["version"].as<String>();
-    url     = doc["url"].as<String>();
-    sha256  = doc["sha256"].as<String>();
-
-    Serial.printf("[Manifest] version=%s url=%s sha256=%s\n", version.c_str(), url.c_str(), sha256.c_str());
-    return true;
+  } else {
+    Serial.println("[BootCheck] No new firmware on boot.");
+  }
 }
 
+// Scheduled check in loop
+void scheduledCheckerLoop() {
+  if(bootUpdateApplied || scheduledRunToday) return;
+
+  time_t now = time(nullptr);
+  if(now < 100000) return; // invalid NTP time
+
+  struct tm t;
+  gmtime_r(&now, &t);
+
+  if(t.tm_hour > SCHEDULED_HOUR_UTC ||
+     (t.tm_hour == SCHEDULED_HOUR_UTC && t.tm_min >= SCHEDULED_MINUTE_UTC)){
+    Serial.printf("[Scheduler] UTC time %02d:%02d reached. Checking for firmware...\n", t.tm_hour, t.tm_min);
+    FirmwareInfo fw;
+    if(fetchManifest(fw) && isNewerVersion(fw.version, currentVersion)){
+      if(downloadFirmware(fw.url, fw.sha256)) applyFirmware();
+    }
+    scheduledRunToday = true;
+  }
+
+  // Reset scheduledRunToday at UTC midnight
+  if(t.tm_hour == 0 && t.tm_min == 0){
+    scheduledRunToday = false;
+  }
+}
+
+// ====== SETUP ======
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
+  Serial.begin(115200);
+  delay(1000);
 
-    Serial.print(F("Current FW Version: "));
-    Serial.println(F(currentVersion));
+  initSPIFFS();
+  initWiFi();
+  initNTP();
 
-    WiFi.begin(ssid, password);
-    Serial.println("[WiFi] Connecting...");
-    while(WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("\n[WiFi] Connected!");
-
-    String availableVersion, firmwareURL, expectedSha;
-    if(fetchManifest(availableVersion, firmwareURL, expectedSha)) {
-        if(availableVersion != currentVersion) {
-            Serial.printf("[BootCheck] New version available: %s (current: %s). Downloading...\n", availableVersion.c_str(), currentVersion);
-            if(downloadAndVerifyFirmware(firmwareURL, expectedSha)) {
-                applyFirmware();
-            } else {
-                Serial.println("[BootCheck] Download or verification failed.");
-            }
-        } else {
-            Serial.println("[BootCheck] Firmware up-to-date.");
-        }
-    } else {
-        Serial.println("[BootCheck] Failed to fetch manifest.");
-    }
+  bootFirmwareCheck();
 }
 
+// ====== LOOP ======
 void loop() {
-    // Optional: add periodic update checks here later
+  scheduledCheckerLoop();
+  delay(1000); // small delay to prevent busy-loop
 }
