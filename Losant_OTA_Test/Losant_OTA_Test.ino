@@ -12,7 +12,7 @@ const char* ssid = "Elab";
 const char* password = "2026summit";
 
 // Current firmware version of the device
-const char* currentVersion = "1.0.0";
+const char* currentVersion = "1.0.2";
 
 // Scheduled OTA check time
 const int SCHEDULED_HOUR_UTC = 6;
