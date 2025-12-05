@@ -8,15 +8,15 @@
 #include "time.h"
 
 // ====== USER CONFIG ======
-const char* ssid = "Elab";
-const char* password = "2026summit";
+const char* ssid = "DarkoAP";
+const char* password = "1qazXcvb";
 
 // Current firmware version of the device
-const char* currentVersion = "1.0.4";
+const char* currentVersion = "1.0.5";
 
 // Scheduled OTA check time (UTC)
-const int SCHEDULED_HOUR_UTC = 22;
-const int SCHEDULED_MINUTE_UTC = 25;
+const int SCHEDULED_HOUR_UTC = 15;
+const int SCHEDULED_MINUTE_UTC = 47;
 
 // NTP config
 const char* NTP_SERVER = "pool.ntp.org";
@@ -291,7 +291,7 @@ void scheduledCheckerLoop() {
 
   struct tm t;
   gmtime_r(&now, &t);
-
+/*
   Serial.print("t.tm_hour: ");
   Serial.println(t.tm_hour);
   Serial.print("t.tm_min: ");
@@ -299,7 +299,7 @@ void scheduledCheckerLoop() {
   Serial.print("SCHEDULED_HOUR_UTC: ");
   Serial.println(SCHEDULED_HOUR_UTC);
   Serial.print("SCHEDULED_MINUTE_UTC: ");
-  Serial.println(SCHEDULED_MINUTE_UTC);
+  Serial.println(SCHEDULED_MINUTE_UTC);*/
 
   if(t.tm_hour == SCHEDULED_HOUR_UTC && t.tm_min >= SCHEDULED_MINUTE_UTC) {
     Serial.printf("[Scheduler] UTC time %02d:%02d reached. Checking for firmware...\n", t.tm_hour, t.tm_min);
