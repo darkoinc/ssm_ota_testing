@@ -12,11 +12,11 @@ const char* ssid = "Elab";
 const char* password = "2026summit";
 
 // Current firmware version of the device
-const char* currentVersion = "1.0.3";
+const char* currentVersion = "1.0.4";
 
-// Scheduled OTA check time
-const int SCHEDULED_HOUR_UTC = 6;
-const int SCHEDULED_MINUTE_UTC = 0;
+// Scheduled OTA check time (UTC)
+const int SCHEDULED_HOUR_UTC = 22;
+const int SCHEDULED_MINUTE_UTC = 25;
 
 // NTP config
 const char* NTP_SERVER = "pool.ntp.org";
@@ -27,8 +27,11 @@ const int   DAYLIGHT_OFFSET_SEC = 0;
 const int MAX_OTA_RETRIES = 3;
 
 // ====== GLOBALS ======
-bool scheduledRunToday = false;
 bool bootUpdateApplied = false;
+bool scheduledRunToday = false;
+int lastScheduledDay = -1;
+
+bool schedulerReady = false; // new flag
 
 // Firmware info structure
 struct FirmwareInfo {
@@ -71,21 +74,23 @@ void initNTP() {
   Serial.println("\n[Time] NTP initialized.");
 }
 
+// Proper semantic version comparison
 bool isNewerVersion(const String& newVer, const String& currentVer) {
-  return newVer != currentVer; // simple check; can be improved with proper semantic version comparison
+  int nv[3] = {0,0,0};
+  int cv[3] = {0,0,0};
+  
+  sscanf(newVer.c_str(), "%d.%d.%d", &nv[0], &nv[1], &nv[2]);
+  sscanf(currentVer.c_str(), "%d.%d.%d", &cv[0], &cv[1], &cv[2]);
+
+  for(int i=0;i<3;i++){
+    if(nv[i] > cv[i]) return true;
+    if(nv[i] < cv[i]) return false;
+  }
+  return false; // versions are equal
 }
 
-// Compute SHA256 of buffer
-void computeSHA256(const uint8_t* data, size_t len, uint8_t* outHash) {
-  mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts_ret(&ctx, 0);
-  mbedtls_sha256_update_ret(&ctx, data, len);
-  mbedtls_sha256_finish_ret(&ctx, outHash);
-  mbedtls_sha256_free(&ctx);
-}
 
-// Convert byte array to hex string
+// Convert SHA256 bytes to hex string
 String hashToString(const uint8_t* hash, size_t len) {
   String s;
   for(size_t i=0;i<len;i++){
@@ -96,11 +101,11 @@ String hashToString(const uint8_t* hash, size_t len) {
   return s;
 }
 
-// Fetch manifest from a URL
+// Fetch manifest from URL
 bool fetchManifest(FirmwareInfo &fw) {
-  const char* manifestURL = "https://raw.githubusercontent.com/darkoinc/SSM_OTA_Host/refs/heads/main/manifest.json"; // set your manifest URL
+  const char* manifestURL = "https://raw.githubusercontent.com/darkoinc/SSM_OTA_Host/refs/heads/main/manifest.json"; 
   WiFiClientSecure client;
-  client.setInsecure(); // Skip cert verification for GitHub (optional, not for production)
+  client.setInsecure(); // Skip cert verification (not for production)
   
   HTTPClient https;
   if(!https.begin(client, manifestURL)) {
@@ -261,23 +266,25 @@ bool applyFirmware() {
   return true;
 }
 
-// Boot-time firmware check
 void bootFirmwareCheck() {
   FirmwareInfo fw;
   if(fetchManifest(fw) && isNewerVersion(fw.version, currentVersion)){
     Serial.println("[BootCheck] New firmware available, applying immediately...");
     if(downloadFirmware(fw.url, fw.sha256)){
       applyFirmware();
-      bootUpdateApplied = true;
     }
   } else {
     Serial.println("[BootCheck] No new firmware on boot.");
   }
+
+  // Mark that boot check has run so scheduler doesn't trigger immediately
+  bootUpdateApplied = true;
 }
 
-// Scheduled check in loop
 void scheduledCheckerLoop() {
-  if(bootUpdateApplied || scheduledRunToday) return;
+  if(!schedulerReady) return; // skip until ready
+
+  if(scheduledRunToday) return;
 
   time_t now = time(nullptr);
   if(now < 100000) return; // invalid NTP time
@@ -285,8 +292,16 @@ void scheduledCheckerLoop() {
   struct tm t;
   gmtime_r(&now, &t);
 
-  if(t.tm_hour > SCHEDULED_HOUR_UTC ||
-     (t.tm_hour == SCHEDULED_HOUR_UTC && t.tm_min >= SCHEDULED_MINUTE_UTC)){
+  Serial.print("t.tm_hour: ");
+  Serial.println(t.tm_hour);
+  Serial.print("t.tm_min: ");
+  Serial.println(t.tm_min);
+  Serial.print("SCHEDULED_HOUR_UTC: ");
+  Serial.println(SCHEDULED_HOUR_UTC);
+  Serial.print("SCHEDULED_MINUTE_UTC: ");
+  Serial.println(SCHEDULED_MINUTE_UTC);
+
+  if(t.tm_hour == SCHEDULED_HOUR_UTC && t.tm_min >= SCHEDULED_MINUTE_UTC) {
     Serial.printf("[Scheduler] UTC time %02d:%02d reached. Checking for firmware...\n", t.tm_hour, t.tm_min);
     FirmwareInfo fw;
     if(fetchManifest(fw) && isNewerVersion(fw.version, currentVersion)){
@@ -309,6 +324,8 @@ void setup() {
   initSPIFFS();
   initWiFi();
   initNTP();
+  schedulerReady = true;
+
 
   bootFirmwareCheck();
 }
@@ -316,5 +333,5 @@ void setup() {
 // ====== LOOP ======
 void loop() {
   scheduledCheckerLoop();
-  delay(1000); // small delay to prevent busy-loop
+  delay(1000);
 }
